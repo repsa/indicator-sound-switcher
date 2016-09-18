@@ -20,7 +20,7 @@
 APP_ID      = "indicator-sound-switcher"
 APP_NAME    = "Sound Switcher Indicator"
 APP_ICON    = "indicator-sound-switcher"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 APP_LICENCE = '''This program is free software: you can redistribute it and/or modify it
 under the terms of the GNU General Public License version 3, as published
 by the Free Software Foundation.
@@ -34,6 +34,10 @@ You should have received a copy of the GNU General Public License along
 with this program. If not, see http://www.gnu.org/licenses/'''
 
 import sys
+import gi
+
+gi.require_version('Gtk', '3.0')
+gi.require_version('AppIndicator3', '0.1')
 
 from gi.repository import GObject
 from gi.repository import Gtk
@@ -148,6 +152,7 @@ class SoundSwitcherIndicator(GObject.GObject):
     self.source_outputs = {}
     self.sinks          = {}
     self.sink_inputs    = {}
+    self.profiles       = {}
     # Create the menu
     self.item_separator_sources = None
     self.item_separator_sinks   = None
@@ -189,6 +194,13 @@ class SoundSwitcherIndicator(GObject.GObject):
         self.synchronise_op(pa_context_get_sink_info_by_index(self.pa_context, index, self._pacb_sink_info, None))
       elif kind == PA_SUBSCRIPTION_EVENT_REMOVE:
         self.sink_remove(index)
+    # -- Card
+    elif facility == PA_SUBSCRIPTION_EVENT_CARD:
+      # Active port change events are fired as PA_SUBSCRIPTION_EVENT_CHANGE
+      if kind == PA_SUBSCRIPTION_EVENT_NEW or kind == PA_SUBSCRIPTION_EVENT_CHANGE:
+        self.synchronise_op(pa_context_get_card_info_by_index(self.pa_context, index, self._pacb_card_info, None))
+      elif kind == PA_SUBSCRIPTION_EVENT_REMOVE:
+        self.sink_remove(index)
     # -- Sink input
     elif facility == PA_SUBSCRIPTION_EVENT_SINK_INPUT:
       if kind == PA_SUBSCRIPTION_EVENT_NEW:
@@ -223,6 +235,10 @@ class SoundSwitcherIndicator(GObject.GObject):
   # Handler of refresh item click event
   def item_refresh(self, widget, buf):
     self.update_all_pa_items()
+
+  # Handler of profile selection item click even
+  def item_select_profile(self, widget, profile, card_index):
+    pa_context_set_card_profile_by_index(self.pa_context, card_index, profile, self._pacb_context_success, None )
 
   # Handler of sink selection item click event
   def item_select_sink(self, widget, buf):
@@ -300,6 +316,12 @@ class SoundSwitcherIndicator(GObject.GObject):
     # Wake up PA's thread
     pa_threaded_mainloop_signal(self.pa_mainloop, 0)
 
+  def pacb_card_info(self, context, struct, index, user_data):
+    if struct:
+      self.card_info(struct.contents.profiles, struct.contents.active_profile, struct.contents.index)
+    # Wake up PA's thread
+    pa_threaded_mainloop_signal(self.pa_mainloop, 0)
+
   def pacb_sink_info(self, context, struct, index, user_data):
     if struct:
       self.sink_info(
@@ -336,6 +358,33 @@ class SoundSwitcherIndicator(GObject.GObject):
       self.source_output_add(struct.contents.index, struct.contents.name)
     # Wake up PA's thread
     pa_threaded_mainloop_signal(self.pa_mainloop, 0)
+
+
+  def card_info(self, profiles, active_profile, card_index):
+    #print profiles[0].name
+    # Prepare ports array: iterate through ports[] (array of pointers to structs)
+    card_profiles = {}
+    if profiles:
+      idx_profile = 0
+      while True:
+        profile_struct = profiles[idx_profile]
+        # NULL pointer terminates the array
+        # print(profile_struct.name)
+        if profile_struct.name:
+          card_profiles[idx_profile] = profile_struct
+          idx_profile += 1
+        else:
+          break
+    # Add a menu item for each profile
+    for idx_profile in card_profiles.keys():
+      profile = card_profiles[idx_profile]
+      if 'output:' in profile.name:
+        profile.menu_item = self.menu_insert_ordered_item(
+          self.item_header_profiles,
+          self.item_separator_profiles,
+          ((profile.description) if idx_profile >= 0 else ""))
+        profile.handler_id = profile.menu_item.connect("activate", self.item_select_profile, profile.name, card_index)
+        self.profiles[idx_profile] = profile
 
   #---------------------------------------------------------------------------------------------------------------------
   # Sink list related procs
@@ -396,6 +445,10 @@ class SoundSwitcherIndicator(GObject.GObject):
   # Removes all sink objects
   def sink_remove_all(self):
     for index in self.sinks.keys(): self.sink_remove(index)
+
+  def profile_remove_all(self):
+    for profile in self.profiles:
+      if profile.menu_item: self.menu.remove(profile.menu_item)
 
   #---------------------------------------------------------------------------------------------------------------------
   # Sink input list related procs
@@ -561,6 +614,9 @@ class SoundSwitcherIndicator(GObject.GObject):
 
   # Initializes indicator menu
   def menu_setup(self):
+    # Make the profiles list section
+    self.item_header_profiles = self.menu_append_item('Profiles')
+    self.item_separator_profiles = self.menu_append_item()
     # Make the source list section
     self.item_header_sources = self.menu_append_item('Inputs')
     self.item_separator_sources = self.menu_append_item()
@@ -575,6 +631,7 @@ class SoundSwitcherIndicator(GObject.GObject):
   # PulseAudio initialization. Returns True if succeeded
   def pulseaudio_initialize(self):
     # Setup the callbacks
+    self._pacb_card_info          = pa_card_info_cb_t         (self.pacb_card_info)
     self._pacb_context_notify     = pa_context_notify_cb_t    (self.pacb_context_notify)
     self._pacb_context_subscribe  = pa_context_subscribe_cb_t (self.pacb_context_subscribe)
     self._pacb_context_success    = pa_context_success_cb_t   (self.pacb_context_success)
@@ -651,10 +708,13 @@ class SoundSwitcherIndicator(GObject.GObject):
   # Synchronously updates information about all PulseAudio items (sinks, sources, server etc.)
   def update_all_pa_items(self):
     # Remove all PA objects
+    self.profile_remove_all()
     self.source_remove_all()
     self.source_output_remove_all()
     self.sink_remove_all()
     self.sink_input_remove_all()
+    # Profiles
+    self.synchronise_op(pa_context_get_card_info_list         (self.pa_context, self._pacb_card_info,          None))
     # Sources
     self.synchronise_op(pa_context_get_source_info_list       (self.pa_context, self._pacb_source_info,        None))
     # Source outputs
