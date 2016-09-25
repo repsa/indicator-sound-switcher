@@ -83,6 +83,23 @@ class SoundSwitcherIndicator(GObject.GObject):
       # Activate signal's handler ID (will be used for inhibiting the handler later)
       self.handler_id  = None
 
+
+  class Profile(Port):
+
+    def get_is_active(self):
+      return self._is_active
+
+    def set_is_active(self, value):
+      self._is_active = value
+      # If activated and the owner sink/source is active too, also activate the item that corresponds to the active port
+      if value and self.menu_item:
+        # Inhibit the activate event
+        with self.menu_item.handler_block(self.handler_id):
+          self.menu_item.set_active(True)
+
+    is_active = GObject.property(type=bool, default=False, getter=get_is_active, setter=set_is_active)
+
+
   #---------------------------------------------------------------------------------------------------------------------
   # Base class for sink and source
   #---------------------------------------------------------------------------------------------------------------------
@@ -192,13 +209,8 @@ class SoundSwitcherIndicator(GObject.GObject):
       # Active port change events are fired as PA_SUBSCRIPTION_EVENT_CHANGE
       if kind == PA_SUBSCRIPTION_EVENT_NEW or kind == PA_SUBSCRIPTION_EVENT_CHANGE:
         self.synchronise_op(pa_context_get_sink_info_by_index(self.pa_context, index, self._pacb_sink_info, None))
-      elif kind == PA_SUBSCRIPTION_EVENT_REMOVE:
-        self.sink_remove(index)
-    # -- Card
-    elif facility == PA_SUBSCRIPTION_EVENT_CARD:
-      # Active port change events are fired as PA_SUBSCRIPTION_EVENT_CHANGE
-      if kind == PA_SUBSCRIPTION_EVENT_NEW or kind == PA_SUBSCRIPTION_EVENT_CHANGE:
-        self.synchronise_op(pa_context_get_card_info_by_index(self.pa_context, index, self._pacb_card_info, None))
+        self.profile_remove_all()
+        self.synchronise_op(pa_context_get_card_info_list(self.pa_context, self._pacb_card_info, None))
       elif kind == PA_SUBSCRIPTION_EVENT_REMOVE:
         self.sink_remove(index)
     # -- Sink input
@@ -238,7 +250,8 @@ class SoundSwitcherIndicator(GObject.GObject):
 
   # Handler of profile selection item click even
   def item_select_profile(self, widget, profile, card_index):
-    pa_context_set_card_profile_by_index(self.pa_context, card_index, profile, self._pacb_context_success, None )
+    if widget.get_active():
+      pa_context_set_card_profile_by_index(self.pa_context, card_index, profile, self._pacb_context_success, None )
 
   # Handler of sink selection item click event
   def item_select_sink(self, widget, buf):
@@ -361,30 +374,29 @@ class SoundSwitcherIndicator(GObject.GObject):
 
 
   def card_info(self, profiles, active_profile, card_index):
-    #print profiles[0].name
+    
     # Prepare ports array: iterate through ports[] (array of pointers to structs)
-    card_profiles = {}
     if profiles:
       idx_profile = 0
       while True:
         profile_struct = profiles[idx_profile]
         # NULL pointer terminates the array
-        # print(profile_struct.name)
         if profile_struct.name:
-          card_profiles[idx_profile] = profile_struct
+          self.profiles[idx_profile] = self.Profile(profile_struct.name, profile_struct.description, profile_struct.priority)
           idx_profile += 1
         else:
           break
     # Add a menu item for each profile
-    for idx_profile in card_profiles.keys():
-      profile = card_profiles[idx_profile]
+    for idx_profile in self.profiles.keys():
+      profile = self.profiles[idx_profile]
       if 'output:' in profile.name:
         profile.menu_item = self.menu_insert_ordered_item(
           self.item_header_profiles,
           self.item_separator_profiles,
           ((profile.description) if idx_profile >= 0 else ""))
         profile.handler_id = profile.menu_item.connect("activate", self.item_select_profile, profile.name, card_index)
-        self.profiles[idx_profile] = profile
+        if profile.name == active_profile.contents.name:
+          profile.is_active = profile.name
 
   #---------------------------------------------------------------------------------------------------------------------
   # Sink list related procs
@@ -399,7 +411,7 @@ class SoundSwitcherIndicator(GObject.GObject):
     # Otherwise register a new sink object
     else:
       self._log("    + Sink[{}] addition: '{}'".format(index, name))
-      # Prepare ports array: iterate through ports[] (array of pointers to structs)
+      # Prepare ports array: iterate through ports[] (array of pointers to structs)addition
       sink_ports = {}
       if ports:
         idx_port = 0
@@ -447,7 +459,7 @@ class SoundSwitcherIndicator(GObject.GObject):
     for index in self.sinks.keys(): self.sink_remove(index)
 
   def profile_remove_all(self):
-    for profile in self.profiles:
+    for profile in self.profiles.values():
       if profile.menu_item: self.menu.remove(profile.menu_item)
 
   #---------------------------------------------------------------------------------------------------------------------
